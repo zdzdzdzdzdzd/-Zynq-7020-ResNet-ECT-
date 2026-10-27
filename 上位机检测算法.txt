@@ -1,0 +1,313 @@
+import os
+import glob
+import numpy as np
+from scipy.ndimage import uniform_filter1d
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+from collections import defaultdict
+import pywt  # 需安装: pip install PyWavelets
+
+
+# ================= 0. 全局配置 =================
+CONFIG = {
+    'input_dir': './data',
+    'output_dir': './dataset_sym4_L3_aug2',
+    'fs_raw': 1_000_000,
+    'decim_rate': 100,
+
+    # 滑窗切片配置
+    'slice_len_sec': 1,
+    'step_len_sec': 1.5,
+
+    # 专属小波参数
+    'wavelet_type': 'sym4',
+    'wavelet_level': 3,
+    'wavelet_c': 0.40
+}
+
+CONFIG['fs_new'] = CONFIG['fs_raw'] // CONFIG['decim_rate']
+CONFIG['slice_len'] = int(CONFIG['slice_len_sec'] * CONFIG['fs_new'])
+CONFIG['step_len'] = int(CONFIG['step_len_sec'] * CONFIG['fs_new'])
+
+if not os.path.exists(CONFIG['output_dir']):
+    os.makedirs(CONFIG['output_dir'])
+
+
+# ================= 1. 标签解析 =================
+def parse_label(filename):
+    base = os.path.basename(filename).lower()
+    head = base.split('-')[0]
+
+    if 'z' in head or 'normal' in head:
+        return 0
+
+    try:
+        val_str = "".join([c for c in head if c.isdigit() or c == '.'])
+        val = float(val_str)
+
+        if abs(val - 0.5) < 0.1:
+            return 1
+        if abs(val - 1.0) < 0.1:
+            return 2
+        if abs(val - 1.5) < 0.1:
+            return 3
+        if abs(val - 2.0) < 0.1:
+            return 4
+        if abs(val - 3.0) < 0.1:
+            return 5
+        if abs(val - 5.0) < 0.1:
+            return 6
+        if abs(val - 6.0) < 0.1:
+            return 7
+    except:
+        pass
+
+    return -1
+
+
+# ================= 2. 信号预处理 =================
+def preprocess_signal(filepath):
+    """
+    读取
+      -> 提取包络
+      -> 降采样
+      -> sym4 小波滤波
+      -> 去基线
+    """
+    try:
+        raw = np.fromfile(filepath, dtype=np.uint16).astype(np.float32)
+        if len(raw) == 0:
+            return None
+
+        # 1. 提取包络
+        raw_mean = np.mean(raw)
+        raw_env = np.abs(raw - raw_mean)
+
+        # 2. 降采样
+        n_blocks = len(raw_env) // CONFIG['decim_rate']
+        raw_trim = raw_env[:n_blocks * CONFIG['decim_rate']]
+        sig_ds = raw_trim.reshape(n_blocks, CONFIG['decim_rate']).max(axis=1)
+
+        # 3. sym4 + L3 + c=0.40 小波滤波
+        coeffs = pywt.wavedec(sig_ds, CONFIG['wavelet_type'], level=CONFIG['wavelet_level'])
+        sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+        uthresh = CONFIG['wavelet_c'] * sigma * np.sqrt(2 * np.log(len(sig_ds)))
+        new_coeffs = [coeffs[0]] + [
+            pywt.threshold(c, value=uthresh, mode='soft') for c in coeffs[1:]
+        ]
+        sig_wavelet = pywt.waverec(new_coeffs, CONFIG['wavelet_type'])
+
+        if len(sig_wavelet) > len(sig_ds):
+            sig_wavelet = sig_wavelet[:len(sig_ds)]
+
+        # 4. 去基线
+        baseline = uniform_filter1d(sig_wavelet, size=int(2 * CONFIG['fs_new']))
+        sig_ready = sig_wavelet - baseline
+
+        return sig_ready
+
+    except Exception as e:
+        print(f"Error processing {filepath}: {e}")
+        return None
+
+
+# ================= 3. 根据文件生成滑窗 meta =================
+def build_meta(file_list, name):
+        meta = []
+    class_stats = defaultdict(int)
+
+    for f in tqdm(file_list, desc=f"Building {name} slices"):
+        label = parse_label(f)
+        if label == -1:
+            continue
+
+        sig_ready = preprocess_signal(f)
+        if sig_ready is None:
+            continue
+
+        total_len = len(sig_ready)
+        for start_idx in range(
+            0,
+            total_len - CONFIG['slice_len'] + 1,
+            CONFIG['step_len']
+        ):
+            meta.append((f, start_idx, label))
+            class_stats[label] += 1
+
+    print(f"\n📊 {name} 基础切片统计：")
+    for k in sorted(class_stats.keys()):
+        print(f"  Class {k}: {class_stats[k]} 个切片")
+
+    return np.array(meta, dtype=object)
+
+
+# ================= 4. 主流水线 =================
+def main():
+    print(">>> [1/3] 扫描原始测量文件...")
+
+    # 找到120个原始测量文件
+    all_files = sorted(glob.glob(os.path.join(CONFIG['input_dir'], '*.bin')))
+    valid_files = []
+    file_labels = []
+
+    for f in all_files:
+        label = parse_label(f)
+        if label == -1:
+            continue
+        valid_files.append(f)
+        file_labels.append(label)
+
+    valid_files = np.array(valid_files, dtype=object)
+    file_labels = np.array(file_labels, dtype=np.int64)
+
+    print(f"\n有效测量文件总数：{len(valid_files)}")
+    print("\n📊 各类别原始测量文件数量：")
+
+    for label in sorted(np.unique(file_labels)):
+        count = np.sum(file_labels == label)
+        print(f"  Class {label}: {count} 个文件")
+
+    print("\n>>> [2/3] 执行分层划分 (70% Train, 20% Val, 10% Test)...")
+
+    # 第一次划分：90% Train + Val，10% Test
+    train_val_files, test_files, train_val_y, test_y = train_test_split(
+        valid_files,
+        file_labels,
+        test_size=0.1,
+        stratify=file_labels,
+        random_state=42
+    )
+
+    # 第二次划分：原数据70% Train，20% Val；20 / 90 = 2 / 9
+    train_files, val_files, train_y, val_y = train_test_split(
+        train_val_files,
+        train_val_y,
+        test_size=2 / 9,
+        stratify=train_val_y,
+        random_state=42
+    )
+
+    # 现在才分别进行滑窗切片
+    print("\n开始分别生成 Train / Val / Test 滑窗...")
+    train_meta = build_meta(train_files, "Train")
+    val_meta = build_meta(val_files, "Val")
+    test_meta = build_meta(test_files, "Test")
+
+    # 数据转换与保存
+    def extract_process_save(meta_list, name):
+        X_Time = []
+        X_Freq = []
+        Y = []
+        file_tasks = defaultdict(list)
+
+        for item in meta_list:
+            file_tasks[item[0]].append((item[1], item[2]))
+
+        # 训练集增强比例
+        aug_target = {}
+
+        if name == 'train':
+            class_counts = defaultdict(int)
+
+            for item in meta_list:
+                class_counts[item[2]] += 1
+
+            max_count = max(class_counts.values()) if class_counts else 1
+            target_count = max_count * 5
+            aug_target = {
+                k: int(np.ceil(target_count / v))
+                for k, v in class_counts.items()
+            }
+
+        for f in tqdm(file_tasks.keys(), desc=f"Generating {name}.npz"):
+            sig_ready = preprocess_signal(f)
+            if sig_ready is None:
+                continue
+
+            for start_idx, label in file_tasks[f]:
+                # 只对训练集做数据增强
+                if name == 'train':
+                    num_augs = aug_target[label]
+                    offsets = [0, -5000, 5000]
+
+                    while len(offsets) < num_augs:
+                        offsets.append(np.random.randint(-5000, 5001))
+
+                    offsets = offsets[:num_augs]
+                else:
+                    # Val / Test 完全不增强
+                    offsets = [0]
+
+                # 生成原始 + 增强样本
+                for i, off in enumerate(offsets):
+                    # 只有训练增强样本做时间缩放
+                    if name == 'train' and i > 0:
+                        time_scale = np.random.uniform(0.9, 1.1)
+                    else:
+                        time_scale = 1.0
+
+                    # 动态窗口长度
+                    extract_len = int(CONFIG['slice_len'] * time_scale)
+                    s = start_idx + off
+                    e = start_idx + off + extract_len
+
+                    # 边界保护
+                    if s < 0 or e > len(sig_ready):
+                        continue
+
+                    slice_data_raw = sig_ready[s:e].copy()
+
+                    # 时间缩放后统一恢复到 slice_len
+                    if extract_len != CONFIG['slice_len']:
+                        x_old = np.linspace(0, 1, extract_len)
+                        x_new = np.linspace(0, 1, CONFIG['slice_len'])
+                        slice_data = np.interp(x_new, x_old, slice_data_raw)
+                    else:
+                        slice_data = slice_data_raw
+
+                    # 高斯噪声增强
+                    if name == 'train' and i > 0:
+                        noise_std = np.std(slice_data) * np.random.uniform(0.01, 0.05)
+                        slice_data += np.random.normal(0, noise_std, size=slice_data.shape)
+
+                    # 1. 时域归一化
+                    sig_norm = (
+                        slice_data - np.mean(slice_data)
+                    ) / (
+                        np.std(slice_data) + 1e-8
+                    )
+
+                    # 2. FFT
+                    p1 = np.abs(np.fft.fft(sig_norm)) / CONFIG['slice_len']
+                    p1 = p1[:CONFIG['slice_len'] // 2]
+                    p1[1:] = 2 * p1[1:]
+
+                    X_Time.append(sig_norm)
+                    X_Freq.append(p1)
+                    Y.append(label)
+
+        # 转数组
+        xt = np.array(X_Time, dtype=np.float32)[:, np.newaxis, :]
+        xf = np.array(X_Freq, dtype=np.float32)[:, np.newaxis, :]
+        y = np.array(Y, dtype=np.int64)
+
+        # 保存
+        np.savez(
+            os.path.join(CONFIG['output_dir'], f'{name}.npz'),
+            x_time=xt,
+            x_freq=xf,
+            y=y
+        )
+        print(f"    {name} Saved: 时域={xt.shape}, 频域={xf.shape}, 标签={y.shape}")
+
+    # 最终生成数据
+    print("\n>>> [3/3] 执行最终转换与数据增强...")
+    extract_process_save(train_meta, 'train')
+    extract_process_save(val_meta, 'val')
+    extract_process_save(test_meta, 'test')
+
+    print(f"\n✅ 数据集制作完成！路径：{CONFIG['output_dir']}")
+
+
+if __name__ == '__main__':
+    main()
